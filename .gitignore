@@ -1,0 +1,6 @@
+.env
+/codeweft
+coverage.out
+*.test
+docs
+.superpowers
