@@ -48,6 +48,17 @@ func DiscoverWithIndex(ctx context.Context, root string, index config.Index) ([]
 	return files, err
 }
 
+// InspectWithIndex applies the same root, exclusion, size, and content policy
+// used by discovery to one project-relative candidate.
+func InspectWithIndex(root, path string, index config.Index) (File, string, error) {
+	root, err := canonicalRoot(root)
+	if err != nil {
+		return File{}, "", err
+	}
+	file, reason := inspectFile(root, path, index, false)
+	return file, reason, nil
+}
+
 func discover(ctx context.Context, root string, index config.Index) ([]File, []string, error) {
 	root, err := canonicalRoot(root)
 	if err != nil {
@@ -264,6 +275,11 @@ func resolveInsideRoot(root, path string) (string, error) {
 	rel, err := filepath.Rel(root, resolved)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("path escapes project root")
+	}
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if fixedExcludedDir(part) {
+			return "", fmt.Errorf("path resolves into excluded directory")
+		}
 	}
 	return resolved, nil
 }

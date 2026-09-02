@@ -1,0 +1,7 @@
+{
+  "name": "script-project",
+  "exports": "./src/esm.mjs",
+  "module": "./src/esm.mjs",
+  "main": "./src/legacy.cjs",
+  "types": "./src/types.d.ts"
+}
