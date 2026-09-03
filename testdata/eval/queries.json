@@ -1,0 +1,8 @@
+[
+  {
+    "question": "Where is the example request handler registered?",
+    "expected_paths": ["internal"],
+    "expected_symbols": ["Handler"],
+    "max_tokens": 3500
+  }
+]

@@ -1,6 +1,6 @@
+.git
 .env
-!.env.example
-/codeweft
+codeweft
 coverage.out
 *.test
 .superpowers

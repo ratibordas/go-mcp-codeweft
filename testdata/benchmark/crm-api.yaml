@@ -1,0 +1,9 @@
+index:
+  max_file_bytes: 2097152
+  include_tests: false
+  exclude_paths: ["docs"]
+  exclude_dir_names: ["mocks"]
+  exclude_file_names: ["README.md"]
+retrieval:
+  max_tokens: 3500
+  graph_depth: 2

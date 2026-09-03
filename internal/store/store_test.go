@@ -169,6 +169,10 @@ func TestWriteDerivedWritesAllDerivedTables(t *testing.T) {
 			t.Fatalf("project id not inherited from file: %#v", batch.rows[0])
 		}
 	}
+	if !strings.Contains(db.batches[0].rows[0][11].(string), "a.go") ||
+		!strings.Contains(db.batches[2].rows[0][8].(string), "readme.md") {
+		t.Fatal("search text does not include the source path")
+	}
 	if db.containsInsert("files") {
 		t.Fatal("derived batches activated the file")
 	}

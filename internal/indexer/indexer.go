@@ -157,13 +157,14 @@ type work struct {
 }
 
 type waiter struct {
-	ctx     context.Context
-	cancel  context.CancelFunc
-	sink    core.ProgressSink
-	updates chan core.Progress
-	done    chan struct{}
-	exited  chan struct{}
-	once    sync.Once
+	ctx       context.Context
+	cancel    context.CancelFunc
+	sink      core.ProgressSink
+	mandatory chan core.Progress
+	latest    chan core.Progress
+	done      chan struct{}
+	exited    chan struct{}
+	once      sync.Once
 }
 
 func New(cfg Config) *Indexer {
@@ -212,11 +213,12 @@ func (i *Indexer) Sync(ctx context.Context, mode Mode, sink core.ProgressSink) (
 	selected.mu.Lock()
 	selected.waiters[id] = registered
 	selected.mu.Unlock()
+	deliverCurrent := !start && i.active == selected
 	i.mu.Unlock()
 	if start {
 		go i.run(selected)
-	} else {
-		registered.deliver(i.Status().Progress)
+	} else if deliverCurrent {
+		registered.deliver(i.Status().Progress, false)
 	}
 	select {
 	case <-ctx.Done():
@@ -239,6 +241,8 @@ func (i *Indexer) EnsureFresh(ctx context.Context, paths []string, sink core.Pro
 	}
 	return result, nil
 }
+
+func (i *Indexer) Initialize(ctx context.Context) error { return i.loadState(ctx) }
 
 func (i *Indexer) Pending() []string {
 	i.mu.Lock()
@@ -349,23 +353,26 @@ func newWaiter(ctx context.Context, sink core.ProgressSink) *waiter {
 	}
 	// Phase changes are few and mandatory. Keep enough room for a complete run
 	// while rate-limited updates remain non-blocking for the indexing worker.
-	w.updates = make(chan core.Progress, 64)
+	w.mandatory = make(chan core.Progress, 8)
+	w.latest = make(chan core.Progress, 1)
 	w.done = make(chan struct{})
 	w.exited = make(chan struct{})
 	go func() {
 		defer close(w.exited)
 		for {
 			select {
+			case progress := <-w.mandatory:
+				w.call(progress)
+				continue
+			default:
+			}
+			select {
 			case <-w.done:
-				for {
-					select {
-					case progress := <-w.updates:
-						w.call(progress)
-					default:
-						return
-					}
-				}
-			case progress := <-w.updates:
+				w.drain()
+				return
+			case progress := <-w.mandatory:
+				w.call(progress)
+			case progress := <-w.latest:
 				w.call(progress)
 			}
 		}
@@ -378,20 +385,47 @@ func (w *waiter) call(progress core.Progress) {
 	w.sink(w.ctx, progress)
 }
 
-func (w *waiter) deliver(progress core.Progress) {
-	if w == nil || w.updates == nil || w.ctx.Err() != nil {
+func (w *waiter) deliver(progress core.Progress, mandatory bool) {
+	if w == nil || w.latest == nil || w.ctx.Err() != nil {
 		return
 	}
-	select {
-	case w.updates <- progress:
-	default:
+	if mandatory {
 		select {
-		case <-w.updates:
+		case <-w.latest:
 		default:
 		}
 		select {
-		case w.updates <- progress:
+		case w.mandatory <- progress:
 		default:
+		}
+		return
+	}
+	select {
+	case w.latest <- progress:
+	default:
+		select {
+		case <-w.latest:
+		default:
+		}
+		select {
+		case w.latest <- progress:
+		default:
+		}
+	}
+}
+
+func (w *waiter) drain() {
+	for {
+		select {
+		case progress := <-w.mandatory:
+			w.call(progress)
+		default:
+			select {
+			case progress := <-w.latest:
+				w.call(progress)
+			default:
+				return
+			}
 		}
 	}
 }
@@ -434,7 +468,7 @@ func (i *Indexer) execute(ctx context.Context, current *work) (result core.SyncR
 	}
 	result.Generation = generation
 	tracker := newTracker(i.cfg.Now, i.cfg.HistoricRates)
-	tracker.setEmitter(func(progress core.Progress) { broadcast(current, progress) })
+	tracker.setEmitter(func(progress core.Progress, mandatory bool) { broadcast(current, progress, mandatory) })
 	tracker.begin(generation)
 	tracker.activeGeneration(startGeneration)
 	i.mu.Lock()
@@ -475,6 +509,7 @@ func (i *Indexer) execute(ctx context.Context, current *work) (result core.SyncR
 	result.Warnings = append(result.Warnings, warnings...)
 	plan.Deleted = sortedUnique(append(plan.Deleted, capturedDeletes...))
 	result.Pending = capturePending
+	consultedBaseline := captureHashes(manifest, inputs)
 	tracker.counts(0, uint64(len(plan.Deleted)), uint64(skipped), 0)
 	tracker.advance(uint64(len(inputs)), uint64(len(inputs)), 0, 0)
 
@@ -503,7 +538,7 @@ func (i *Indexer) execute(ctx context.Context, current *work) (result core.SyncR
 	tracker.advance(uint64(chunkCount(outputs)), uint64(chunkCount(outputs)), uint64(len(outputs)), uint64(chunkCount(outputs)))
 
 	tracker.phase("persist", uint64(len(outputs)+len(plan.Deleted)))
-	pending, activated, err := i.persist(ctx, current, outputs, plan.Deleted, manifest, generation, consulted, tracker)
+	pending, activated, err := i.persist(ctx, current, outputs, plan.Deleted, manifest, generation, consulted, consultedBaseline, tracker)
 	if err != nil {
 		return result, err
 	}
@@ -990,13 +1025,13 @@ func (i *Indexer) embed(ctx context.Context, outputs map[string]core.IndexedFile
 	return nil, pending, nil
 }
 
-func (i *Indexer) persist(ctx context.Context, current *work, outputs map[string]core.IndexedFile, deleted []string, manifest map[string]core.FileState, generation uint64, consulted map[string]string, tracker *Tracker) ([]string, int, error) {
+func (i *Indexer) persist(ctx context.Context, current *work, outputs map[string]core.IndexedFile, deleted []string, manifest map[string]core.FileState, generation uint64, consulted, consultedBaseline map[string]string, tracker *Tracker) ([]string, int, error) {
 	pending := []string{}
-	if changed := i.changedConsulted(ctx, consulted); changed != "" {
+	if changed := i.changedConsulted(ctx, consulted, consultedBaseline); changed != "" {
 		return consultedPending(changed, outputs, deleted), 0, nil
 	}
 	for _, path := range sortedUnique(deleted) {
-		if changed := i.changedConsulted(ctx, consulted); changed != "" {
+		if changed := i.changedConsulted(ctx, consulted, consultedBaseline); changed != "" {
 			return consultedPending(changed, outputs, deleted), 0, nil
 		}
 		current.setActivating()
@@ -1012,7 +1047,7 @@ func (i *Indexer) persist(ctx context.Context, current *work, outputs map[string
 		if err := ctx.Err(); err != nil {
 			return pending, activated, err
 		}
-		if changed := i.changedConsulted(ctx, consulted); changed != "" {
+		if changed := i.changedConsulted(ctx, consulted, consultedBaseline); changed != "" {
 			return sortedUnique(append(pending, consultedPending(changed, mapSubset(outputs, paths[index:]), nil)...)), activated, nil
 		}
 		indexed := outputs[path]
@@ -1025,7 +1060,7 @@ func (i *Indexer) persist(ctx context.Context, current *work, outputs map[string
 			pending = append(pending, path)
 			continue
 		}
-		if changed := i.changedConsulted(ctx, consulted); changed != "" {
+		if changed := i.changedConsulted(ctx, consulted, consultedBaseline); changed != "" {
 			return sortedUnique(append(pending, consultedPending(changed, mapSubset(outputs, paths[index:]), nil)...)), activated, nil
 		}
 		if err := i.cfg.Store.ActivateFile(ctx, fileState(i.cfg.ProjectID, current, generation)); err != nil {
@@ -1039,14 +1074,28 @@ func (i *Indexer) persist(ctx context.Context, current *work, outputs map[string
 
 // changedConsulted is the final ABA fence. Parsers report the exact bytes they
 // consumed; activation is allowed only while every such path still has them.
-func (i *Indexer) changedConsulted(ctx context.Context, consulted map[string]string) string {
+func (i *Indexer) changedConsulted(ctx context.Context, consulted, baseline map[string]string) string {
 	for _, filePath := range sortedMapKeys(consulted) {
+		if baseline[filePath] != consulted[filePath] {
+			return filePath
+		}
 		data, err := i.cfg.Source.Read(ctx, filePath)
 		if err != nil || contentHash(data) != consulted[filePath] {
 			return filePath
 		}
 	}
 	return ""
+}
+
+func captureHashes(manifest map[string]core.FileState, inputs map[string]capturedFile) map[string]string {
+	result := make(map[string]string, len(manifest)+len(inputs))
+	for filePath, file := range manifest {
+		result[filePath] = file.Hash
+	}
+	for filePath, input := range inputs {
+		result[filePath] = input.file.Hash
+	}
+	return result
 }
 
 func consultedPending(changed string, outputs map[string]core.IndexedFile, deleted []string) []string {
@@ -1098,7 +1147,7 @@ func newRunID(reader io.Reader) (string, error) {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", value[:4], value[4:6], value[6:8], value[8:10], value[10:]), nil
 }
 
-func broadcast(current *work, progress core.Progress) {
+func broadcast(current *work, progress core.Progress, mandatory bool) {
 	current.mu.Lock()
 	waiters := make([]*waiter, 0, len(current.waiters))
 	for _, waiter := range current.waiters {
@@ -1106,7 +1155,7 @@ func broadcast(current *work, progress core.Progress) {
 	}
 	current.mu.Unlock()
 	for _, waiter := range waiters {
-		waiter.deliver(progress)
+		waiter.deliver(progress, mandatory)
 	}
 }
 
@@ -1386,11 +1435,13 @@ func filterPaths(pending, requested []string) []string {
 	if len(requested) == 0 {
 		return sortedUnique(pending)
 	}
-	wanted := stringSet(requested)
 	result := []string{}
-	for _, path := range pending {
-		if wanted[path] {
-			result = append(result, path)
+	for _, pendingPath := range pending {
+		for _, requestedPath := range requested {
+			if pendingPath == requestedPath || strings.HasPrefix(pendingPath, strings.TrimSuffix(requestedPath, "/")+"/") {
+				result = append(result, pendingPath)
+				break
+			}
 		}
 	}
 	return sortedUnique(result)
@@ -1457,6 +1508,11 @@ func runStatus(run RunSnapshot, manifest map[string]core.FileState) core.IndexSt
 		if file.Generation > active {
 			active = file.Generation
 		}
+	}
+	if len(run.Pending) == 0 && run.TargetGeneration > active {
+		active = run.TargetGeneration
+	} else if len(run.Pending) != 0 && run.StartGeneration > active {
+		active = run.StartGeneration
 	}
 	lastSuccess := time.Time{}
 	if run.FinishedAt != nil {

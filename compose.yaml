@@ -1,0 +1,33 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.1.2041
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  codeweft:
+    build: .
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CODEWEFT_CLICKHOUSE_DSN: ${CODEWEFT_CLICKHOUSE_DSN:-clickhouse://clickhouse:9000/codeweft}
+      CODEWEFT_CLICKHOUSE_USER: ${CODEWEFT_CLICKHOUSE_USER:-default}
+      CODEWEFT_CLICKHOUSE_PASSWORD: ${CODEWEFT_CLICKHOUSE_PASSWORD:-}
+      CODEWEFT_OLLAMA_URL: ${CODEWEFT_OLLAMA_URL:-http://host.docker.internal:11434}
+      CODEWEFT_OLLAMA_TOKEN: ${CODEWEFT_OLLAMA_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${CODEWEFT_PROJECT_PATH:?set CODEWEFT_PROJECT_PATH}:/project:ro
+
+volumes:
+  clickhouse-data:

@@ -18,7 +18,7 @@ type Tracker struct {
 	started      time.Time
 	phaseStarted time.Time
 	lastEmit     time.Time
-	emit         func(core.Progress)
+	emit         func(core.Progress, bool)
 }
 
 func NewTracker(history map[string]float64) *Tracker {
@@ -63,7 +63,7 @@ func (t *Tracker) phase(phase string, total uint64) {
 	progress, emit := t.status.Progress, t.emit
 	t.mu.Unlock()
 	if emit != nil {
-		emit(progress)
+		emit(progress, true)
 	}
 }
 
@@ -91,7 +91,7 @@ func (t *Tracker) advance(completed, total, files, chunks uint64) {
 	progress, emit := t.status.Progress, t.emit
 	t.mu.Unlock()
 	if emit != nil {
-		emit(progress)
+		emit(progress, false)
 	}
 }
 
@@ -154,7 +154,7 @@ func (t *Tracker) emitFinal() {
 	progress, emit := t.status.Progress, t.emit
 	t.mu.RUnlock()
 	if emit != nil {
-		emit(progress)
+		emit(progress, true)
 	}
 }
 
@@ -176,7 +176,7 @@ func (t *Tracker) runStatusSnapshot() core.IndexStatus {
 	return status
 }
 
-func (t *Tracker) setEmitter(emit func(core.Progress)) {
+func (t *Tracker) setEmitter(emit func(core.Progress, bool)) {
 	t.mu.Lock()
 	t.emit = emit
 	t.mu.Unlock()

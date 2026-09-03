@@ -112,6 +112,41 @@ func TestFullSupersedesQueuedDeltaWithoutInterruptingActiveRun(t *testing.T) {
 	}
 }
 
+func TestQueuedWaiterDoesNotReceiveActiveRunProgress(t *testing.T) {
+	deps := newDeps(file("a.md", "hello"))
+	deps.markdown.started = make(chan struct{}, 1)
+	deps.markdown.block = make(chan struct{})
+	idx := indexer.New(deps.config())
+	active := make(chan error, 1)
+	go func() { _, err := idx.Sync(context.Background(), indexer.Delta, nil); active <- err }()
+	<-deps.markdown.started
+
+	progress := make(chan core.Progress, 1)
+	queued := make(chan error, 1)
+	go func() {
+		_, err := idx.Sync(context.Background(), indexer.Full, func(_ context.Context, update core.Progress) {
+			select {
+			case progress <- update:
+			default:
+			}
+		})
+		queued <- err
+	}()
+	select {
+	case update := <-progress:
+		t.Fatalf("queued waiter received active progress: %+v", update)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(deps.markdown.block)
+	if err := <-active; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-queued; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEmbeddingsReuseHashesAndBatchMissingChunksInOrder(t *testing.T) {
 	files := []project.File{}
 	for i := 0; i < 18; i++ {
@@ -171,6 +206,17 @@ func TestFileChangedDuringParseIsNotActivated(t *testing.T) {
 	deps.markChangedDuringParse("a.md", "third")
 	if _, err := idx.EnsureFresh(context.Background(), []string{"a.md"}, nil); err == nil {
 		t.Fatal("freshness barrier accepted pending path")
+	}
+}
+
+func TestEnsureFreshTreatsRequestedPathsAsPrefixes(t *testing.T) {
+	deps := newDeps(file("docs/api.md", "first"))
+	deps.markChangedDuringParse("docs/api.md", "second")
+	idx := indexer.New(deps.config())
+	_, err := idx.EnsureFresh(context.Background(), []string{"docs"}, nil)
+	var freshnessErr *indexer.FreshnessError
+	if !errors.As(err, &freshnessErr) || !slices.Equal(freshnessErr.Paths, []string{"docs/api.md"}) {
+		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -327,6 +373,28 @@ func TestConsultedDependencyChangeLeavesDependentPending(t *testing.T) {
 	}
 }
 
+func TestConsultedDependencyMustMatchPlanningSnapshot(t *testing.T) {
+	a := file("app/a.go", "package app")
+	oldDependency := file("lib/dep.go", "package lib\nconst Version = 1")
+	newDependency := file("lib/dep.go", "package lib\nconst Version = 2")
+	deps := newDeps(a)
+	deps.store.ManifestState[oldDependency.Path] = state(oldDependency, 1)
+	deps.source.files[newDependency.Path] = newDependency
+	deps.source.data[newDependency.Path] = []byte("package p\nconst Version = 2")
+	deps.goParser.result = goparser.Result{
+		Files:     []core.IndexedFile{{File: core.FileState{Path: a.Path}}},
+		Consulted: map[string]string{newDependency.Path: newDependency.Hash},
+	}
+
+	result, err := indexer.New(deps.config()).Sync(context.Background(), indexer.Delta, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(result.Pending, []string{"app/a.go", "lib/dep.go"}) || len(deps.store.Activated) != 0 || len(deps.store.Derived) != 0 {
+		t.Fatalf("consulted dependency escaped planning snapshot: result=%+v activated=%v derived=%v", result, deps.store.Activated, deps.store.Derived)
+	}
+}
+
 func TestConsultedEmptyConfigDeletionLeavesScriptPending(t *testing.T) {
 	a := file("a.ts", "export const a = 1")
 	config := project.File{Path: "tsconfig.json", Kind: "resolution", Language: "typescript", Extension: ".json", Hash: hash(""), MTimeNS: 1}
@@ -422,6 +490,22 @@ func TestFullCleanupFailureIsOnlyAWarningAndRunStoresGitState(t *testing.T) {
 	run := deps.store.Runs[len(deps.store.Runs)-1]
 	if run.GitHead != "head" || !slices.Equal(run.DirtyPaths, []string{"a.md"}) || run.State == "" {
 		t.Fatalf("run = %+v", run)
+	}
+}
+
+func TestInitializeRestoresStatusWithoutStartingAWrite(t *testing.T) {
+	deps := newDeps()
+	deps.store.ManifestState["a.go"] = core.FileState{Path: "a.go", Hash: hash("a"), Generation: 5, ParserVersion: project.ParserVersion}
+	deps.store.LatestRun = indexer.RunSnapshot{State: "ready", TargetGeneration: 5}
+	idx := indexer.New(deps.config())
+	if err := idx.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if idx.Status().State != "ready" || idx.Status().ActiveGeneration != 5 || idx.Manifest()["a.go"].Generation != 5 {
+		t.Fatalf("status=%+v manifest=%+v", idx.Status(), idx.Manifest())
+	}
+	if len(deps.store.Runs) != 0 || len(deps.store.Activated) != 0 {
+		t.Fatal("initialize wrote index state")
 	}
 }
 
@@ -554,9 +638,22 @@ func (p *fakeScriptParser) Parse(context.Context, tsparser.Request) (tsparser.Re
 	return p.result, p.err
 }
 
-type fakeMarkdown struct{ after func() }
+type fakeMarkdown struct {
+	after   func()
+	started chan struct{}
+	block   chan struct{}
+}
 
 func (p *fakeMarkdown) Parse(path string, data []byte, fileHash string) ([]core.DocChunk, []string, error) {
+	if p.started != nil {
+		select {
+		case p.started <- struct{}{}:
+		default:
+		}
+	}
+	if p.block != nil {
+		<-p.block
+	}
 	if p.after != nil {
 		after := p.after
 		p.after = nil

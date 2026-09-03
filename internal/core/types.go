@@ -50,10 +50,21 @@ type IndexedFile struct {
 }
 
 type Candidate struct {
-	ID, Type, Match, Language, Extension, Path, Symbol, Relation, Heading, FileHash string
-	StartLine, EndLine                                                              uint32
-	Score, Weight                                                                   float64
-	Content                                                                         string
+	ID        string  `json:"id"`
+	Type      string  `json:"type"`
+	Match     string  `json:"match,omitempty"`
+	Language  string  `json:"language,omitempty"`
+	Extension string  `json:"extension,omitempty"`
+	Path      string  `json:"path"`
+	Symbol    string  `json:"symbol,omitempty"`
+	Relation  string  `json:"relation,omitempty"`
+	Heading   string  `json:"heading,omitempty"`
+	FileHash  string  `json:"file_hash,omitempty"`
+	StartLine uint32  `json:"start_line"`
+	EndLine   uint32  `json:"end_line"`
+	Score     float64 `json:"score"`
+	Weight    float64 `json:"weight"`
+	Content   string  `json:"content,omitempty"`
 }
 
 type SearchRequest struct {
@@ -73,11 +84,17 @@ type GenerateRequest struct {
 }
 
 type Progress struct {
-	Phase                             string
-	Completed, Total                  uint64
-	Changed, Deleted, Skipped, Failed uint64
-	Elapsed, ETA                      time.Duration
-	FilesPerSecond, ChunksPerSecond   float64
+	Phase           string        `json:"phase"`
+	Completed       uint64        `json:"completed"`
+	Total           uint64        `json:"total"`
+	Changed         uint64        `json:"changed"`
+	Deleted         uint64        `json:"deleted"`
+	Skipped         uint64        `json:"skipped"`
+	Failed          uint64        `json:"failed"`
+	Elapsed         time.Duration `json:"elapsed"`
+	ETA             time.Duration `json:"eta"`
+	FilesPerSecond  float64       `json:"files_per_second"`
+	ChunksPerSecond float64       `json:"chunks_per_second"`
 }
 
 func (p Progress) Message() string {
@@ -85,23 +102,32 @@ func (p Progress) Message() string {
 }
 
 type IndexStatus struct {
-	State, Phase, LastError            string
-	ActiveGeneration, TargetGeneration uint64
-	Progress                           Progress
-	LastSuccess                        time.Time
-	Pending, Warnings                  []string
-	PhaseTimings                       map[string]time.Duration
+	State            string                   `json:"state"`
+	Phase            string                   `json:"phase"`
+	LastError        string                   `json:"last_error,omitempty"`
+	ActiveGeneration uint64                   `json:"active_generation"`
+	TargetGeneration uint64                   `json:"target_generation"`
+	Progress         Progress                 `json:"progress"`
+	LastSuccess      time.Time                `json:"last_success"`
+	Pending          []string                 `json:"pending,omitempty"`
+	Warnings         []string                 `json:"warnings,omitempty"`
+	PhaseTimings     map[string]time.Duration `json:"phase_timings,omitempty"`
 }
 
 type SyncResult struct {
-	Generation                        uint64
-	Changed, Deleted, Skipped, Failed int
-	Pending, Warnings                 []string
+	Generation uint64   `json:"generation"`
+	Changed    int      `json:"changed"`
+	Deleted    int      `json:"deleted"`
+	Skipped    int      `json:"skipped"`
+	Failed     int      `json:"failed"`
+	Pending    []string `json:"pending,omitempty"`
+	Warnings   []string `json:"warnings,omitempty"`
 }
 
 type ModelHealth struct {
-	GenerationAvailable, EmbeddingAvailable bool
-	Warnings                                []string
+	GenerationAvailable bool     `json:"generation_available"`
+	EmbeddingAvailable  bool     `json:"embedding_available"`
+	Warnings            []string `json:"warnings,omitempty"`
 }
 
 type RetrievalResult struct {

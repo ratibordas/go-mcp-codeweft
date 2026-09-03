@@ -71,7 +71,7 @@ func (s *Store) WriteDerived(ctx context.Context, file core.IndexedFile) error {
 	}
 	unitRows := make([][]any, 0, len(file.Units))
 	for _, unit := range file.Units {
-		searchText := normalizeSearchText(unit.Name + " " + unit.QualifiedName + " " + unit.Source)
+		searchText := normalizeSearchText(unit.Path + " " + unit.Name + " " + unit.QualifiedName + " " + unit.Source)
 		unitRows = append(unitRows, []any{
 			file.File.ProjectID, unit.ID, unit.Name, unit.QualifiedName, unit.Kind, unit.Language,
 			unit.Extension, unit.Path, unit.StartLine, unit.EndLine, unit.Source, searchText,
@@ -99,6 +99,7 @@ func (s *Store) WriteDerived(ctx context.Context, file core.IndexedFile) error {
 		if searchText == "" {
 			searchText = chunk.Heading + " " + chunk.Content
 		}
+		searchText = chunk.Path + " " + searchText
 		chunkRows = append(chunkRows, []any{
 			file.File.ProjectID, chunk.ID, chunk.Path, chunk.Extension, chunk.Heading,
 			chunk.StartLine, chunk.EndLine, chunk.Content, normalizeSearchText(searchText), chunk.Tags,
