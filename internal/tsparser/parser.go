@@ -28,6 +28,7 @@ type Request struct {
 	Paths      []string
 	Generation uint64
 	FileHashes map[string]string
+	Sources    map[string][]byte
 }
 
 type Result struct {
@@ -35,6 +36,7 @@ type Result struct {
 	ModuleImports        map[string][]string
 	ReverseModuleImports map[string][]string
 	Warnings             []string
+	Consulted            map[string]string
 }
 
 type Parser struct{}
@@ -101,7 +103,7 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	paths, err := sourcePaths(ctx, root, hashes, req.Paths)
+	paths, err := sourcePaths(ctx, root, hashes, req.Paths, req.Sources)
 	if err != nil {
 		return Result{}, err
 	}
@@ -109,7 +111,7 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	resolver, err := newResolver(root)
+	resolver, err := newResolver(root, req.Sources)
 	if err != nil {
 		return Result{}, err
 	}
@@ -136,7 +138,8 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 			closeSyntaxFiles(files)
 			return Result{}, err
 		}
-		file, parseWarnings, err := parseFile(root, path)
+		captured, capturedOK := req.Sources[path]
+		file, parseWarnings, err := parseFile(root, path, captured, capturedOK)
 		if err != nil {
 			warnings = append(warnings, path+": "+err.Error())
 			continue
@@ -155,7 +158,14 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{ModuleImports: map[string][]string{}, ReverseModuleImports: map[string][]string{}}
+	result := Result{ModuleImports: map[string][]string{}, ReverseModuleImports: map[string][]string{}, Consulted: map[string]string{}}
+	for path, file := range files {
+		sum := sha256.Sum256(file.source)
+		result.Consulted[path] = fmt.Sprintf("%x", sum)
+	}
+	for path, hash := range resolver.consulted {
+		result.Consulted[path] = hash
+	}
 
 	for _, path := range selected {
 		if err := ctx.Err(); err != nil {
@@ -215,14 +225,18 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 	return result, nil
 }
 
-func parseFile(root, path string) (*syntaxFile, []string, error) {
+func parseFile(root, path string, captured []byte, capturedOK bool) (*syntaxFile, []string, error) {
 	full, ok := safeExistingPath(root, path)
 	if !ok {
 		return nil, nil, errors.New("path is missing or escapes project root")
 	}
-	source, err := os.ReadFile(full)
-	if err != nil {
-		return nil, nil, err
+	source := append([]byte(nil), captured...)
+	if !capturedOK {
+		var err error
+		source, err = os.ReadFile(full)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	extension := sourceExtension(path)
 	language := languageFor(extension)
@@ -1229,7 +1243,7 @@ func externalName(id string) string {
 	return value
 }
 
-func sourcePaths(ctx context.Context, root string, hashes map[string]string, requested []string) ([]string, error) {
+func sourcePaths(ctx context.Context, root string, hashes map[string]string, requested []string, sources map[string][]byte) ([]string, error) {
 	if hashes != nil {
 		paths := make([]string, 0, len(hashes))
 		for path := range hashes {
@@ -1237,6 +1251,10 @@ func sourcePaths(ctx context.Context, root string, hashes map[string]string, req
 				return nil, err
 			}
 			if sourceExtension(path) == "" {
+				continue
+			}
+			if _, captured := sources[path]; captured {
+				paths = append(paths, path)
 				continue
 			}
 			if _, reason, err := project.InspectWithIndex(root, path, config.Index{IncludeTests: true}); err != nil {

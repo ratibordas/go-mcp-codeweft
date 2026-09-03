@@ -2,6 +2,7 @@ package tsparser
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,8 @@ type resolver struct {
 	allowed    map[string]bool
 	policy     func(string) bool
 	warnings   map[string]bool
+	sources    map[string][]byte
+	consulted  map[string]string
 }
 
 func (r *resolver) withPolicy(policy func(string) bool) *resolver {
@@ -65,15 +68,21 @@ type packageConfig struct {
 	Exports json.RawMessage `json:"exports"`
 }
 
-func newResolver(root string) (*resolver, error) {
+func newResolver(root string, captured ...map[string][]byte) (*resolver, error) {
 	root, err := canonicalRoot(root)
 	if err != nil {
 		return nil, err
 	}
-	r := &resolver{root: root, warnings: map[string]bool{}}
+	sources := map[string][]byte{}
+	if len(captured) != 0 {
+		for path, data := range captured[0] {
+			sources[path] = append([]byte(nil), data...)
+		}
+	}
+	r := &resolver{root: root, warnings: map[string]bool{}, sources: sources, consulted: map[string]string{}}
 	for _, name := range []string{"tsconfig.json", "jsconfig.json"} {
 		var config compilerConfig
-		if err := readSafeJSON(root, name, &config); err != nil {
+		if err := r.readJSON(name, &config); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
@@ -118,6 +127,27 @@ func newResolver(root string) (*resolver, error) {
 		break
 	}
 	return r, nil
+}
+
+func (r *resolver) readJSON(path string, value any) error {
+	if data, ok := r.sources[path]; ok {
+		if err := decodeJSON(data, value); err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		r.consulted[path] = fmt.Sprintf("%x", sum)
+		return nil
+	}
+	data, err := readSafeJSONBytes(r.root, path)
+	if err != nil {
+		return err
+	}
+	if err := decodeJSON(data, value); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(data)
+	r.consulted[path] = fmt.Sprintf("%x", sum)
+	return nil
 }
 
 func (r *resolver) Resolve(importer, specifier string) (string, bool) {
@@ -200,7 +230,7 @@ func (r *resolver) resolveCandidate(candidate string, seen map[string]bool) (str
 		return "", false
 	}
 	var config packageConfig
-	if err := readSafeJSON(r.root, candidate+"/package.json", &config); err == nil {
+	if err := r.readJSON(candidate+"/package.json", &config); err == nil {
 		targets := packageTargets(config)
 		for _, target := range targets {
 			cleanTarget, ok := safePackageTarget(target)
@@ -262,7 +292,7 @@ func (r *resolver) resolveContainedPackageCandidate(packageDir, candidate, decla
 		return "", false
 	}
 	var config packageConfig
-	if err := readSafeJSON(r.root, candidate+"/package.json", &config); err == nil {
+	if err := r.readJSON(candidate+"/package.json", &config); err == nil {
 		for _, target := range packageTargets(config) {
 			cleanTarget, ok := safePackageTarget(target)
 			if !ok {
@@ -415,6 +445,10 @@ func readJSON(path string, value any) error {
 	if len(data) > 1<<20 {
 		return errors.New("metadata exceeds 1MiB")
 	}
+	return decodeJSON(data, value)
+}
+
+func decodeJSON(data []byte, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(value); err != nil {
 		return err
@@ -430,19 +464,39 @@ func readJSON(path string, value any) error {
 }
 
 func readSafeJSON(root, path string, value any) error {
-	path, err := safePath(path)
-	if err != nil || containsPathPart(path, "node_modules") {
-		return errors.New("unsafe metadata path")
-	}
-	full, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(path)))
+	data, err := readSafeJSONBytes(root, path)
 	if err != nil {
 		return err
 	}
+	return decodeJSON(data, value)
+}
+
+func readSafeJSONBytes(root, path string) ([]byte, error) {
+	path, err := safePath(path)
+	if err != nil || containsPathPart(path, "node_modules") {
+		return nil, errors.New("unsafe metadata path")
+	}
+	full, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(path)))
+	if err != nil {
+		return nil, err
+	}
 	relative, ok := relativeInside(root, full)
 	if !ok || containsPathPart(relative, "node_modules") {
-		return errors.New("metadata path escapes project root")
+		return nil, errors.New("metadata path escapes project root")
 	}
-	return readJSON(full, value)
+	file, err := os.Open(full)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 1<<20 {
+		return nil, errors.New("metadata exceeds 1MiB")
+	}
+	return data, nil
 }
 
 func canonicalRoot(root string) (string, error) {

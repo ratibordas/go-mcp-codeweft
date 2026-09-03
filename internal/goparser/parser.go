@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"io/fs"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ratibordas/go-mcp-codeweft/internal/core"
 	"golang.org/x/tools/go/callgraph/vta"
@@ -29,6 +31,7 @@ type Request struct {
 	Patterns   []string
 	Generation uint64
 	FileHashes map[string]string
+	Sources    map[string][]byte
 }
 
 type Result struct {
@@ -37,6 +40,7 @@ type Result struct {
 	ReversePackageImports map[string][]string
 	FilePackages          map[string]string
 	Warnings              []string
+	Consulted             map[string]string
 }
 
 type Parser struct{}
@@ -100,7 +104,8 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	loaded, warnings, err := loadPackages(ctx, root, patterns)
+	consulted := map[string]string{}
+	loaded, warnings, err := loadPackages(ctx, root, patterns, req.Sources, consulted)
 	if err != nil {
 		return Result{}, err
 	}
@@ -113,6 +118,17 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 		PackageImports:        map[string][]string{},
 		ReversePackageImports: map[string][]string{},
 		FilePackages:          map[string]string{},
+		Consulted:             consulted,
+	}
+	// packages.Load consumes module/workspace files in the overlay as resolution
+	// inputs. Report the exact captured bytes so the indexer can fence their ABA
+	// lifetime before activating package output.
+	for filePath, contents := range req.Sources {
+		switch filepath.Base(filePath) {
+		case "go.mod", "go.sum", "go.work":
+			sum := sha256.Sum256(contents)
+			result.Consulted[filePath] = fmt.Sprintf("%x", sum)
+		}
 	}
 	files := map[string]*fileOutput{}
 	packageFiles := map[string]string{}
@@ -139,12 +155,18 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 			if !allowedFile(item.path, hashes) || ast.IsGenerated(item.file) {
 				continue
 			}
-			contents, readErr := os.ReadFile(item.filename)
-			if readErr != nil {
-				warnings = append(warnings, item.path+": "+readErr.Error())
-				continue
+			contents, exists := req.Sources[item.path]
+			if !exists {
+				var readErr error
+				contents, readErr = os.ReadFile(item.filename)
+				if readErr != nil {
+					warnings = append(warnings, item.path+": "+readErr.Error())
+					continue
+				}
 			}
 			current.filePaths[item.path] = true
+			sum := sha256.Sum256(contents)
+			result.Consulted[item.path] = fmt.Sprintf("%x", sum)
 			result.FilePackages[item.path] = pkg.PkgPath
 			out := files[item.path]
 			if out != nil {
@@ -868,7 +890,7 @@ func allowedFile(path string, hashes map[string]string) bool {
 	return hashes == nil || ok
 }
 
-func loadPackages(ctx context.Context, root string, patterns []string) (packageLoad, []string, error) {
+func loadPackages(ctx context.Context, root string, patterns []string, sources map[string][]byte, consulted map[string]string) (packageLoad, []string, error) {
 	moduleDirs, err := findModuleDirs(ctx, root)
 	if err != nil {
 		return packageLoad{}, nil, err
@@ -894,6 +916,22 @@ func loadPackages(ctx context.Context, root string, patterns []string) (packageL
 				packages.NeedImports | packages.NeedDeps | packages.NeedModule | packages.NeedForTest,
 			Tests: true,
 			Env:   packageEnvironment(os.Environ(), false),
+		}
+		var consultedMu sync.Mutex
+		cfg.ParseFile = func(fset *token.FileSet, filename string, src []byte) (*ast.File, error) {
+			if relative, err := filepath.Rel(root, filename); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative) {
+				sum := sha256.Sum256(src)
+				consultedMu.Lock()
+				consulted[filepath.ToSlash(relative)] = fmt.Sprintf("%x", sum)
+				consultedMu.Unlock()
+			}
+			return parser.ParseFile(fset, filename, src, parser.ParseComments)
+		}
+		if len(sources) != 0 {
+			cfg.Overlay = make(map[string][]byte, len(sources))
+			for relative, source := range sources {
+				cfg.Overlay[filepath.Join(root, filepath.FromSlash(relative))] = append([]byte(nil), source...)
+			}
 		}
 		pkgs, loadErr := packages.Load(cfg, localPatterns...)
 		if err := ctx.Err(); err != nil {

@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -40,6 +43,7 @@ type Run struct {
 	TargetGeneration uint64
 	GitHead          string
 	DirtyPaths       []string
+	Pending          []string
 	UpdatedAt        time.Time
 }
 
@@ -173,31 +177,97 @@ func (s *Store) LoadManifest(ctx context.Context, projectID string) (map[string]
 	return manifest, nil
 }
 
+func (s *Store) LoadEmbeddings(ctx context.Context, projectID string, chunkHashes []string) (map[string][]float32, error) {
+	hashes := append([]string(nil), chunkHashes...)
+	sort.Strings(hashes)
+	hashes = compactStrings(hashes)
+	result := make(map[string][]float32, len(hashes))
+	if len(hashes) == 0 {
+		return result, nil
+	}
+	const query = `SELECT chunk_hash, argMax(embedding, generation)
+        FROM doc_chunks
+        WHERE project_id = ? AND chunk_hash IN ? AND length(embedding) > 0
+        GROUP BY chunk_hash`
+	rows, err := s.conn.Query(ctx, query, projectID, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("load embeddings: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hash string
+		var embedding []float32
+		if err := rows.Scan(&hash, &embedding); err != nil {
+			return nil, fmt.Errorf("scan embedding: %w", err)
+		}
+		if err := validateEmbedding(embedding); err != nil {
+			return nil, fmt.Errorf("stored chunk %q: %w", hash, err)
+		}
+		result[hash] = append([]float32(nil), embedding...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load embeddings: %w", err)
+	}
+	return result, nil
+}
+
+func compactStrings(values []string) []string {
+	result := values[:0]
+	for _, value := range values {
+		if value != "" && (len(result) == 0 || result[len(result)-1] != value) {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func (s *Store) NextGeneration(ctx context.Context, projectID string) (uint64, error) {
-	const query = `SELECT coalesce(max(generation), 0) + 1 FROM files WHERE project_id = ?`
+	const query = `SELECT max(generation) + 1 FROM (
+        SELECT coalesce(max(generation), 0) AS generation FROM files WHERE project_id = ?
+        UNION ALL SELECT coalesce(max(generation), 0) FROM code_units WHERE project_id = ?
+        UNION ALL SELECT coalesce(max(generation), 0) FROM code_edges WHERE project_id = ?
+        UNION ALL SELECT coalesce(max(generation), 0) FROM doc_chunks WHERE project_id = ?
+        UNION ALL SELECT coalesce(max(target_generation), 0) FROM index_runs WHERE project_id = ?
+    )`
 	var generation uint64
-	if err := s.conn.QueryRow(ctx, query, projectID).Scan(&generation); err != nil {
+	if err := s.conn.QueryRow(ctx, query, projectID, projectID, projectID, projectID, projectID).Scan(&generation); err != nil {
 		return 0, fmt.Errorf("load next generation: %w", err)
 	}
 	return generation, nil
 }
 
 func (s *Store) WriteRun(ctx context.Context, run Run) error {
+	if !validRunID(run.RunID) {
+		return fmt.Errorf("invalid run UUID %q", run.RunID)
+	}
 	if run.UpdatedAt.IsZero() {
 		run.UpdatedAt = time.Now().UTC()
 	}
 	const query = `INSERT INTO index_runs
         (project_id, run_id, mode, state, started_at, finished_at, phase, completed, total, changed, deleted, skipped, failed,
-         files_per_second, chunks_per_second, eta_ms, phase_timings, warnings, error, start_generation, target_generation, git_head, dirty_paths, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	        files_per_second, chunks_per_second, eta_ms, phase_timings, warnings, error, start_generation, target_generation, git_head, dirty_paths, pending, updated_at)
+	        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	if err := s.conn.Exec(ctx, query, run.ProjectID, run.RunID, run.Mode, run.State, run.StartedAt,
 		run.FinishedAt, run.Phase, run.Completed, run.Total, run.Changed, run.Deleted, run.Skipped,
 		run.Failed, run.FilesPerSecond, run.ChunksPerSecond, run.ETAMillis, run.PhaseTimings,
 		run.Warnings, run.Error, run.StartGeneration, run.TargetGeneration, run.GitHead,
-		run.DirtyPaths, run.UpdatedAt); err != nil {
+		run.DirtyPaths, run.Pending, run.UpdatedAt); err != nil {
 		return fmt.Errorf("write index run: %w", err)
 	}
 	return nil
+}
+
+func validRunID(value string) bool {
+	parts := strings.Split(value, "-")
+	if len(parts) != 5 || len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 || len(parts[3]) != 4 || len(parts[4]) != 12 || parts[2][0] != '4' || !strings.ContainsRune("89ab", rune(parts[3][0])) {
+		return false
+	}
+	for _, part := range parts {
+		if _, err := strconv.ParseUint(part, 16, 64); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Store) LoadRunHistory(ctx context.Context, projectID string, limit int) ([]Run, error) {
@@ -209,7 +279,7 @@ func (s *Store) LoadRunHistory(ctx context.Context, projectID string, limit int)
             argMax(files_per_second, updated_at), argMax(chunks_per_second, updated_at), argMax(eta_ms, updated_at),
             argMax(phase_timings, updated_at), argMax(warnings, updated_at), argMax(error, updated_at),
             argMax(start_generation, updated_at), argMax(target_generation, updated_at), argMax(git_head, updated_at),
-            argMax(dirty_paths, updated_at), max(updated_at) AS latest
+	            argMax(dirty_paths, updated_at), argMax(pending, updated_at), max(updated_at) AS latest
         FROM index_runs
         WHERE project_id = ?
         GROUP BY run_id
@@ -227,7 +297,7 @@ func (s *Store) LoadRunHistory(ctx context.Context, projectID string, limit int)
 			&run.Phase, &run.Completed, &run.Total, &run.Changed, &run.Deleted, &run.Skipped,
 			&run.Failed, &run.FilesPerSecond, &run.ChunksPerSecond, &run.ETAMillis,
 			&run.PhaseTimings, &run.Warnings, &run.Error, &run.StartGeneration,
-			&run.TargetGeneration, &run.GitHead, &run.DirtyPaths, &run.UpdatedAt); err != nil {
+			&run.TargetGeneration, &run.GitHead, &run.DirtyPaths, &run.Pending, &run.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan run history: %w", err)
 		}
 		runs = append(runs, run)
@@ -236,6 +306,36 @@ func (s *Store) LoadRunHistory(ctx context.Context, projectID string, limit int)
 		return nil, fmt.Errorf("load run history: %w", err)
 	}
 	return runs, nil
+}
+
+func (s *Store) LoadLatestSuccessfulRun(ctx context.Context, projectID string) (Run, error) {
+	const query = `SELECT run_id, mode, state, started_at, finished_at, phase, completed, total, changed, deleted, skipped, failed, files_per_second, chunks_per_second, eta_ms, phase_timings, warnings, error, start_generation, target_generation, git_head, dirty_paths, pending, updated_at FROM index_runs WHERE project_id = ? AND state IN ('ready', 'degraded') ORDER BY updated_at DESC LIMIT 1`
+	row := s.conn.QueryRow(ctx, query, projectID)
+	run := Run{ProjectID: projectID}
+	err := row.Scan(&run.RunID, &run.Mode, &run.State, &run.StartedAt, &run.FinishedAt, &run.Phase, &run.Completed, &run.Total, &run.Changed, &run.Deleted, &run.Skipped, &run.Failed, &run.FilesPerSecond, &run.ChunksPerSecond, &run.ETAMillis, &run.PhaseTimings, &run.Warnings, &run.Error, &run.StartGeneration, &run.TargetGeneration, &run.GitHead, &run.DirtyPaths, &run.Pending, &run.UpdatedAt)
+	return run, err
+}
+
+func (s *Store) LoadEmbeddingPending(ctx context.Context, projectID string) ([]string, error) {
+	const query = activeFilesCTE + ` SELECT DISTINCT chunks.path FROM doc_chunks AS chunks INNER JOIN active_files ON chunks.project_id = active_files.project_id AND chunks.path = active_files.path AND chunks.file_hash = active_files.file_hash AND chunks.generation = active_files.generation WHERE chunks.project_id = ? AND active_files.deleted = false AND length(chunks.embedding) = 0`
+	rows, err := s.conn.Query(ctx, query, projectID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	paths := []string{}
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		paths = append(paths, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return compactStrings(paths), nil
 }
 
 func (s *Store) CleanupObsolete(ctx context.Context, projectID string) error {

@@ -163,6 +163,9 @@ func inspectFile(root, path string, index config.Index, withHash bool) (File, st
 		return File{}, reason
 	}
 	kindLanguage, ok := extensions[strings.ToLower(filepath.Ext(path))]
+	if language, resolution := resolutionInput(path); resolution {
+		kindLanguage, ok = [2]string{"resolution", language}, true
+	}
 	if !ok {
 		return File{}, "unsupported extension"
 	}
@@ -197,6 +200,16 @@ func inspectFile(root, path string, index config.Index, withHash bool) (File, st
 		}
 	}
 	return file, ""
+}
+
+func resolutionInput(path string) (string, bool) {
+	switch filepath.Base(path) {
+	case "go.mod", "go.sum", "go.work":
+		return "go", true
+	case "tsconfig.json", "jsconfig.json", "package.json":
+		return "typescript", true
+	}
+	return "", false
 }
 
 func contentReason(path string, isGo bool) (string, error) {

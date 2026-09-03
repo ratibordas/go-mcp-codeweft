@@ -206,8 +206,8 @@ func TestMigrateCreatesOnlyConfiguredTables(t *testing.T) {
 	if err := NewWithDB(db).Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(db.execs) != 5 {
-		t.Fatalf("got %d migration statements, want 5", len(db.execs))
+	if len(db.execs) != 6 {
+		t.Fatalf("got %d migration statements, want 6", len(db.execs))
 	}
 	for _, table := range []string{"files", "code_units", "code_edges", "doc_chunks", "index_runs"} {
 		found := false
@@ -235,7 +235,12 @@ func TestNextGenerationReadsMaximum(t *testing.T) {
 		t.Fatalf("got generation %d, want 1", generation)
 	}
 	call := db.queries[0]
-	if !strings.Contains(call.query, "max(generation)") || len(call.args) != 1 || call.args[0] != "p" {
+	for _, table := range []string{"files", "code_units", "code_edges", "doc_chunks", "index_runs"} {
+		if !strings.Contains(call.query, table) {
+			t.Fatalf("generation query omits %s: %s", table, call.query)
+		}
+	}
+	if len(call.args) != 5 || call.args[0] != "p" || call.args[4] != "p" {
 		t.Fatalf("maximum generation query is not project scoped: %#v", call)
 	}
 }
@@ -372,7 +377,7 @@ func TestCleanupObsoleteScopesDerivedRowsByActiveHash(t *testing.T) {
 
 func TestWriteRunSnapshotIsProjectScoped(t *testing.T) {
 	db := newRecordingDB()
-	run := Run{ProjectID: "p", RunID: "00000000-0000-0000-0000-000000000001", Mode: "full", State: "running", StartedAt: time.Unix(1, 0), UpdatedAt: time.Unix(2, 0)}
+	run := Run{ProjectID: "p", RunID: "00000000-0000-4000-8000-000000000001", Mode: "full", State: "running", StartedAt: time.Unix(1, 0), UpdatedAt: time.Unix(2, 0)}
 	if err := NewWithDB(db).WriteRun(context.Background(), run); err != nil {
 		t.Fatal(err)
 	}
@@ -381,6 +386,13 @@ func TestWriteRunSnapshotIsProjectScoped(t *testing.T) {
 	}
 	if len(db.execs[0].args) == 0 || db.execs[0].args[0] != "p" {
 		t.Fatalf("run snapshot lost project scope: %#v", db.execs[0])
+	}
+}
+
+func TestWriteRunRejectsNonUUIDRunID(t *testing.T) {
+	err := NewWithDB(newRecordingDB()).WriteRun(context.Background(), Run{ProjectID: "p", RunID: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("accepted invalid run ID")
 	}
 }
 
@@ -395,6 +407,23 @@ func TestLoadRunHistoryUsesReplacingKeyWithoutFinal(t *testing.T) {
 	}
 	if len(db.queries[0].args) < 1 || db.queries[0].args[0] != "p" {
 		t.Fatalf("run history is not project scoped: %#v", db.queries[0])
+	}
+}
+
+func TestLoadEmbeddingsUsesRequestedChunkHashes(t *testing.T) {
+	db := newRecordingDB()
+	db.results = []driver.Rows{&sliceRows{rows: [][]any{{"h1", make([]float32, 1024)}}}}
+	store := NewWithDB(db)
+	got, err := store.LoadEmbeddings(context.Background(), "project", []string{"h2", "h1", "h1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got["h1"]) != 1024 {
+		t.Fatalf("embedding length = %d", len(got["h1"]))
+	}
+	call := db.queries[len(db.queries)-1]
+	if !strings.Contains(call.query, "chunk_hash IN ?") || len(call.args) != 2 {
+		t.Fatalf("lookup call = %+v", call)
 	}
 }
 
